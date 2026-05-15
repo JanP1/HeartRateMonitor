@@ -147,11 +147,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun estimateBPM() {
         if (measurementData.size < 100) {
-            Log.e(TAG, "Not enough data collected")
+            Log.e(TAG, "Not enough data: ${measurementData.size} frames")
             return
         }
 
-        // 1. Simple Moving Average Smoothing (window of 5)
+        // 1. Moving Average
         val smoothedData = mutableListOf<Double>()
         for (i in 2 until measurementData.size - 2) {
             val avg = (measurementData[i-2] + measurementData[i-1] + measurementData[i] +
@@ -159,24 +159,39 @@ class MainActivity : AppCompatActivity() {
             smoothedData.add(avg)
         }
 
-        // 2. Peak Detection
+        // 2. Debugging Logs - Look at these in Logcat!
+        val minVal = smoothedData.minOrNull() ?: 0.0
+        val maxVal = smoothedData.maxOrNull() ?: 0.0
+        val range = maxVal - minVal
+
+        // We lower the threshold to 1% of the range to catch even weak signals
+        val threshold = minVal + (range * 0.01)
+
+        Log.d(TAG, "Min: $minVal, Max: $maxVal, Range: $range, Threshold: $threshold")
+
         var peakCount = 0
+        val frameGap = 7
+        var lastPeakFrame = -frameGap
+
         for (i in 1 until smoothedData.size - 1) {
-            // A peak is a point higher than its neighbors
-            if (smoothedData[i] > smoothedData[i - 1] && smoothedData[i] > smoothedData[i + 1]) {
+            val isPeak = smoothedData[i] > smoothedData[i - 1] && smoothedData[i] > smoothedData[i + 1]
+            val aboveThreshold = smoothedData[i] > threshold
+            val enoughTimePassed = (i - lastPeakFrame) > frameGap
+
+            if (isPeak && aboveThreshold && enoughTimePassed) {
                 peakCount++
+                lastPeakFrame = i
             }
         }
 
-        // 3. Calculate BPM
-        // Total time was 20 seconds.
         val bpm = (peakCount.toDouble() / 20.0) * 60.0
+        Log.d(TAG, "Final Peak Count: $peakCount")
 
-        Log.d(TAG, "--- TEST RESULTS ---")
-        Log.d(TAG, "Total Peaks Found: $peakCount")
-        Log.d(TAG, "Estimated BPM: ${bpm.toInt()}")
-
-        Toast.makeText(this, "Estimated BPM: ${bpm.toInt()}", Toast.LENGTH_LONG).show()
+        if (peakCount == 0) {
+            Toast.makeText(this, "No pulse detected. Try lighter pressure.", Toast.LENGTH_LONG).show()
+        } else {
+            Toast.makeText(this, "Estimated BPM: ${bpm.toInt()}", Toast.LENGTH_LONG).show()
+        }
     }
 
     override fun onDestroy() {
