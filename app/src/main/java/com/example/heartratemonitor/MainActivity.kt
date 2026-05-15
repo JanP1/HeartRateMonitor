@@ -18,7 +18,6 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import java.util.concurrent.Executors
-import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
 
@@ -27,6 +26,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var viewFinder: PreviewView
     private var isAnalyzing = false
     private val analysisExecutor = Executors.newSingleThreadExecutor()
+
+    // Array to store the readings
+    private val measurementData = mutableListOf<Double>()
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -59,10 +61,7 @@ class MainActivity : AppCompatActivity() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
-
-            val preview = Preview.Builder().build().also {
-                it.surfaceProvider = viewFinder.surfaceProvider
-            }
+            val preview = Preview.Builder().build().also { it.surfaceProvider = viewFinder.surfaceProvider }
 
             val imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -71,27 +70,15 @@ class MainActivity : AppCompatActivity() {
             imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
                 if (isAnalyzing) {
                     val avgGreen = processImageForGreen(imageProxy)
-                    Log.d("HRM_VALUE", "Green Intensity: $avgGreen")
+                    measurementData.add(avgGreen)
                 }
                 imageProxy.close()
             }
 
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-
             try {
                 cameraProvider.unbindAll()
                 camera = cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalysis)
-
-                // --- DISABLE CAMERA ADAPTIVITY ---
-                // We use CameraControl to lock settings once bound
-                val cameraControl = camera?.cameraControl
-
-                // 1. Lock Exposure (AE)
-                // We can't strictly "disable" it in basic CameraX, but we can lock the current state
-                // by setting the exposure compensation or using Camera2Interop for advanced control.
-                // For now, let's keep the focus locked to avoid hunting.
-                cameraControl?.cancelFocusAndMetering()
-
             } catch (e: Exception) {
                 Log.e(TAG, "Binding failed", e)
             }
@@ -99,27 +86,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processImageForGreen(image: ImageProxy): Double {
-        // Plane 0 = Y (Luminance), Plane 1 = U (Chrominance), Plane 2 = V (Chrominance)
         val yBuffer = image.planes[0].buffer
         val uBuffer = image.planes[1].buffer
         val vBuffer = image.planes[2].buffer
 
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val yArray = ByteArray(ySize)
-        val uArray = ByteArray(uSize)
-        val vArray = ByteArray(vSize)
-
-        yBuffer.get(yArray)
-        uBuffer.get(uArray)
-        vBuffer.get(vArray)
+        val yArray = ByteArray(yBuffer.remaining()).also { yBuffer.get(it) }
+        val uArray = ByteArray(uBuffer.remaining()).also { uBuffer.get(it) }
+        val vArray = ByteArray(vBuffer.remaining()).also { vBuffer.get(it) }
 
         val width = image.width
         val height = image.height
-
-        // Sampling a small square in the center
         val centerX = width / 2
         val centerY = height / 2
         val radius = 15
@@ -130,19 +106,14 @@ class MainActivity : AppCompatActivity() {
         for (row in (centerY - radius)..(centerY + radius)) {
             for (col in (centerX - radius)..(centerX + radius)) {
                 val yIndex = row * width + col
-
-                // YUV to RGB conversion formula for the Green channel:
-                // G = Y - 0.344136 * (U - 128) - 0.714136 * (V - 128)
-
-                val y = yArray[yIndex].toInt() and 0xFF
-
-                // U and V planes are usually subsampled (half resolution)
                 val uvIndex = (row / 2) * (width / 2) + (col / 2)
 
-                if (uvIndex < uArray.size && uvIndex < vArray.size) {
+                if (yIndex < yArray.size && uvIndex < uArray.size && uvIndex < vArray.size) {
+                    val y = yArray[yIndex].toInt() and 0xFF
                     val u = uArray[uvIndex].toInt() and 0xFF
                     val v = vArray[uvIndex].toInt() and 0xFF
 
+                    // G = Y - 0.34414 * (U - 128) - 0.71414 * (V - 128)
                     val green = y - 0.34414 * (u - 128) - 0.71414 * (v - 128)
                     greenSum += green
                     count++
@@ -155,24 +126,57 @@ class MainActivity : AppCompatActivity() {
     private fun startHeartRateDetection(button: Button) {
         val cameraControl = camera?.cameraControl ?: return
 
+        measurementData.clear() // Reset data for new test
         button.isEnabled = false
-
-        // Lock settings before we start
-        // This stops the camera from adjusting to the sudden brightness of the finger/flash
         cameraControl.enableTorch(true)
 
-        // Give the camera a half-second to stabilize before we trust the values
-        Handler(Looper.getMainLooper()).postDelayed({
-            isAnalyzing = true
-            Log.d(TAG, "Analysis started - Green Channel")
-        }, 500)
+        Toast.makeText(this, "Keep your finger steady...", Toast.LENGTH_SHORT).show()
 
         Handler(Looper.getMainLooper()).postDelayed({
-            cameraControl.enableTorch(false)
+            isAnalyzing = true
+            Log.d(TAG, "Data collection started")
+        }, 1000)
+
+        Handler(Looper.getMainLooper()).postDelayed({
             isAnalyzing = false
+            cameraControl.enableTorch(false)
             button.isEnabled = true
-            Log.d(TAG, "Measurement finished.")
-        }, 20000L)
+            estimateBPM()
+        }, 21000L) // 1s stabilization + 20s data
+    }
+
+    private fun estimateBPM() {
+        if (measurementData.size < 100) {
+            Log.e(TAG, "Not enough data collected")
+            return
+        }
+
+        // 1. Simple Moving Average Smoothing (window of 5)
+        val smoothedData = mutableListOf<Double>()
+        for (i in 2 until measurementData.size - 2) {
+            val avg = (measurementData[i-2] + measurementData[i-1] + measurementData[i] +
+                    measurementData[i+1] + measurementData[i+2]) / 5
+            smoothedData.add(avg)
+        }
+
+        // 2. Peak Detection
+        var peakCount = 0
+        for (i in 1 until smoothedData.size - 1) {
+            // A peak is a point higher than its neighbors
+            if (smoothedData[i] > smoothedData[i - 1] && smoothedData[i] > smoothedData[i + 1]) {
+                peakCount++
+            }
+        }
+
+        // 3. Calculate BPM
+        // Total time was 20 seconds.
+        val bpm = (peakCount.toDouble() / 20.0) * 60.0
+
+        Log.d(TAG, "--- TEST RESULTS ---")
+        Log.d(TAG, "Total Peaks Found: $peakCount")
+        Log.d(TAG, "Estimated BPM: ${bpm.toInt()}")
+
+        Toast.makeText(this, "Estimated BPM: ${bpm.toInt()}", Toast.LENGTH_LONG).show()
     }
 
     override fun onDestroy() {
