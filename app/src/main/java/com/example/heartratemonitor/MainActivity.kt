@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -24,11 +25,29 @@ class MainActivity : AppCompatActivity() {
     private var camera: Camera? = null
     private val TAG = "HRM_DEBUG"
     private lateinit var viewFinder: PreviewView
+    private lateinit var statusText: TextView
+    private lateinit var flashButton: Button
+
     private var isAnalyzing = false
+    private var isMeasuring = false
+    private val measurementData = mutableListOf<Double>()
     private val analysisExecutor = Executors.newSingleThreadExecutor()
 
-    // Array to store the readings
-    private val measurementData = mutableListOf<Double>()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var secondsRemaining = 20
+
+    // Runnable for the countdown timer
+    private val timerRunnable = object : Runnable {
+        override fun run() {
+            if (secondsRemaining > 0) {
+                statusText.text = secondsRemaining.toString()
+                secondsRemaining--
+                mainHandler.postDelayed(this, 1000)
+            } else {
+                stopMeasurement(true)
+            }
+        }
+    }
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -40,7 +59,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         viewFinder = findViewById(R.id.viewFinder)
-        val flashButton = findViewById<Button>(R.id.flashButton)
+        statusText = findViewById(R.id.statusText)
+        flashButton = findViewById(R.id.flashButton)
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -54,7 +74,13 @@ class MainActivity : AppCompatActivity() {
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
 
-        flashButton.setOnClickListener { startHeartRateDetection(flashButton) }
+        flashButton.setOnClickListener {
+            if (isMeasuring) {
+                stopMeasurement(false) // User clicked Stop
+            } else {
+                startHeartRateDetection()
+            }
+        }
     }
 
     private fun setupCamera() {
@@ -113,7 +139,6 @@ class MainActivity : AppCompatActivity() {
                     val u = uArray[uvIndex].toInt() and 0xFF
                     val v = vArray[uvIndex].toInt() and 0xFF
 
-                    // G = Y - 0.34414 * (U - 128) - 0.71414 * (V - 128)
                     val green = y - 0.34414 * (u - 128) - 0.71414 * (v - 128)
                     greenSum += green
                     count++
@@ -123,35 +148,47 @@ class MainActivity : AppCompatActivity() {
         return if (count > 0) greenSum / count else 0.0
     }
 
-    private fun startHeartRateDetection(button: Button) {
+    private fun startHeartRateDetection() {
         val cameraControl = camera?.cameraControl ?: return
 
-        measurementData.clear() // Reset data for new test
-        button.isEnabled = false
+        isMeasuring = true
+        measurementData.clear()
+        secondsRemaining = 20
+        flashButton.text = "Stop / Reset"
         cameraControl.enableTorch(true)
 
-        Toast.makeText(this, "Keep your finger steady...", Toast.LENGTH_SHORT).show()
+        statusText.text = "Stabilizing..."
 
-        Handler(Looper.getMainLooper()).postDelayed({
-            isAnalyzing = true
-            Log.d(TAG, "Data collection started")
+        // 1 second delay to stabilize light before analyzing
+        mainHandler.postDelayed({
+            if (isMeasuring) {
+                isAnalyzing = true
+                mainHandler.post(timerRunnable)
+            }
         }, 1000)
+    }
 
-        Handler(Looper.getMainLooper()).postDelayed({
-            isAnalyzing = false
-            cameraControl.enableTorch(false)
-            button.isEnabled = true
+    private fun stopMeasurement(completed: Boolean) {
+        isMeasuring = false
+        isAnalyzing = false
+        mainHandler.removeCallbacks(timerRunnable)
+        camera?.cameraControl?.enableTorch(false)
+        flashButton.text = "Start Monitor"
+
+        if (completed) {
             estimateBPM()
-        }, 21000L) // 1s stabilization + 20s data
+        } else {
+            statusText.text = "Reset"
+            measurementData.clear()
+        }
     }
 
     private fun estimateBPM() {
         if (measurementData.size < 100) {
-            Log.e(TAG, "Not enough data: ${measurementData.size} frames")
+            statusText.text = "Error"
             return
         }
 
-        // 1. Moving Average
         val smoothedData = mutableListOf<Double>()
         for (i in 2 until measurementData.size - 2) {
             val avg = (measurementData[i-2] + measurementData[i-1] + measurementData[i] +
@@ -159,15 +196,10 @@ class MainActivity : AppCompatActivity() {
             smoothedData.add(avg)
         }
 
-        // 2. Debugging Logs - Look at these in Logcat!
         val minVal = smoothedData.minOrNull() ?: 0.0
         val maxVal = smoothedData.maxOrNull() ?: 0.0
         val range = maxVal - minVal
-
-        // We lower the threshold to 1% of the range to catch even weak signals
         val threshold = minVal + (range * 0.01)
-
-        Log.d(TAG, "Min: $minVal, Max: $maxVal, Range: $range, Threshold: $threshold")
 
         var peakCount = 0
         val frameGap = 7
@@ -185,17 +217,13 @@ class MainActivity : AppCompatActivity() {
         }
 
         val bpm = (peakCount.toDouble() / 20.0) * 60.0
-        Log.d(TAG, "Final Peak Count: $peakCount")
-
-        if (peakCount == 0) {
-            Toast.makeText(this, "No pulse detected. Try lighter pressure.", Toast.LENGTH_LONG).show()
-        } else {
-            Toast.makeText(this, "Estimated BPM: ${bpm.toInt()}", Toast.LENGTH_LONG).show()
-        }
+        statusText.text = "${bpm.toInt()} BPM"
+        Log.d(TAG, "Result: ${bpm.toInt()} BPM")
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        mainHandler.removeCallbacks(timerRunnable)
         analysisExecutor.shutdown()
     }
 }
